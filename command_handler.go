@@ -10,6 +10,35 @@ import (
 	"strings"
 )
 
+const (
+	limitedCommandRoleID = "1480411247810842634"
+	fullAccessRoleID     = "1480411813534502993"
+)
+
+var limitedRoleAllowedCommands = map[string]bool{
+	StartCommand:   true,
+	StatusCommand:  true,
+	PlayersCommand: true,
+	PingCommand:    true,
+	InfoCommand:    true,
+}
+
+func hasAnyRole(member *discordgo.Member, roleIDs ...string) bool {
+	if member == nil {
+		return false
+	}
+
+	for _, memberRoleID := range member.Roles {
+		for _, allowedRoleID := range roleIDs {
+			if memberRoleID == allowedRoleID {
+				return true
+			}
+		}
+	}
+
+	return false
+}
+
 // handleCommands responds to incoming interactive commands on discord.
 func (ab *Bot) handleCommands(s *discordgo.Session, i *discordgo.InteractionCreate) {
 	command := i.ApplicationCommandData()
@@ -23,6 +52,16 @@ func (ab *Bot) handleCommands(s *discordgo.Session, i *discordgo.InteractionCrea
 	}
 	sendErrorText := func(content string, err error) {
 		respondWithError(s, i, content, err)
+	}
+
+	hasFullAccess := hasAnyRole(i.Member, fullAccessRoleID)
+	hasLimitedAccess := hasAnyRole(i.Member, limitedCommandRoleID)
+
+	if !hasFullAccess {
+		if !hasLimitedAccess || !limitedRoleAllowedCommands[command.Name] {
+			sendHiddenText(message.FormatWarning("You don't have permission to use this command."))
+			return
+		}
 	}
 
 	switch command.Name {
@@ -50,110 +89,104 @@ func (ab *Bot) handleCommands(s *discordgo.Session, i *discordgo.InteractionCrea
 		fallthrough
 	case PlayersCommand:
 		fallthrough
-	case StartCommand:
-		fallthrough
-	case StopCommand:
-		w, err := ab.getWorker(i.GuildID)
-		if err != nil {
-			if err == database.ErrDataNotFound {
-				sendText(message.FormatWarning("Bot setup incomplete. Use `/configure` to configure the bot."))
-			} else {
-				sendErrorText("Failed to get worker", err)
-			}
-			break
-		}
+commands.go
+commands.go
++6
+-7
 
-		serverInfo, err := w.GetServerInfo()
-		if err != nil {
-			if err == aternos.UnauthenticatedError {
-				sendText(message.FormatError("Invalid credentials. Use `/configure` to reconfigure the bot."))
-			} else if err == aternos.ForbiddenError {
-				sendText(message.FormatError("Access forbidden. Please try again later."))
-			} else {
-				sendErrorText("Failed to get server info", err)
-			}
+package aternos_discord_bot
 
-			break
-		}
+import "github.com/bwmarrin/discordgo"
 
-		switch command.Name {
-		case InfoCommand:
-			respondWithEmbeds(s, i, []*discordgo.MessageEmbed{
-				message.CreateServerInfoEmbed(serverInfo),
-			})
-		case StatusCommand:
-			sendText(message.FormatInfo("Server '%s' is currently **%s**.", serverInfo.Name, serverInfo.StatusLabel))
-		case PlayersCommand:
-			if len(serverInfo.PlayerList) == 0 {
-				sendText(message.FormatInfo("No players online right now."))
-				break
-			}
-			sendText(message.FormatInfo("Active players: %s.", strings.Join(serverInfo.PlayerList, ", ")))
-		case StopCommand:
-			fallthrough
-		case StartCommand:
-			// connect to WSS
-			if err = w.Init(); err != nil {
-				sendErrorText("Failed to initialize worker! See `/help` or try again later.", err)
-				break
-			}
+const (
+	HelpCommand      = "help"
+	PingCommand      = "ping"
+	ConfigureCommand = "configure"
+	StartCommand     = "start"
+	StopCommand      = "stop"
+	StatusCommand    = "status"
+	InfoCommand      = "info"
+	PlayersCommand   = "players"
+	SessionOption    = "session"
+	ServerOption     = "server"
+)
 
-			// stop server
-			if command.Name == StopCommand {
-				if serverInfo.Status == aternos.Stopping || serverInfo.Status == aternos.Offline {
-					sendText(message.FormatInfo("Server already stopped! Type `/status` or `/info` to view the status."))
-					break
-				}
+var (
+	adminPermissions int64 = discordgo.PermissionManageServer
+	userPermissions  int64 = discordgo.PermissionUseSlashCommands
+	dmPermission           = false
+	userPermissions int64 = discordgo.PermissionUseSlashCommands
+	dmPermission          = false
+)
 
-				sendText(message.FormatInfo("Stopping the server, please wait..."))
-
-				// TODO: check if we need to put stop() in a goroutine for better performance
-				if err = w.Stop(); err != nil {
-					s.ChannelMessageSend(i.ChannelID, message.FormatError("Failed to stop the server"))
-					w.Log(err.Error())
-				}
-
-				break
-			}
-
-			// start server
-			if serverInfo.Status != aternos.Offline && serverInfo.Status != aternos.Stopping {
-				sendText(message.FormatInfo("Server already started! Type `/status` or `/info` to view the status."))
-				break
-			}
-
-			sendText(message.FormatInfo("Starting the server, please wait..."))
-
-			ctx, cancel := context.WithCancel(context.Background())
-
-			go w.On(ctx, func(messageType string, info *aternos.ServerInfo) {
-				switch messageType {
-				case "ready":
-					if command.Name == StartCommand {
-						if err = w.Start(); err != nil {
-							s.ChannelMessageSend(i.ChannelID, message.FormatError("Failed to start! Reconfigure the bot with `/configure` and try again. See `/help` if the problem persists."))
-							w.Log(err.Error())
-							cancel() // cancel the worker's goroutine
-							break
-						}
-					}
-				case "status":
-					switch info.Status {
-					case aternos.Offline:
-						fallthrough
-					case aternos.Online:
-						notification, _ := message.CreateServerStatusNotificationEmbed(info)
-						s.ChannelMessageSendEmbed(i.ChannelID, notification)
-					case aternos.Preparing:
-						s.ChannelMessageSend(i.ChannelID, message.FormatInfo("Waiting in queue (%d/%d, %s)...", info.Queue.Position, info.Queue.Count, info.Queue.Time))
-						w.Log("Waiting in queue...")
-					}
-				case "connection_error":
-					s.ChannelMessageSend(i.ChannelID, message.FormatError("Failed to initialize worker (websocket connection timeout)! See `/help` or try again later."))
-				}
-			})
-		}
-	default:
-		sendText(message.FormatWarning("Command unavailable. Please try again later or refresh your discord client `CTRL + R`"))
-	}
+// List of available discord commands.
+var commands = []*discordgo.ApplicationCommand{
+	{
+		Name:        ConfigureCommand,
+		Description: "Save configuration settings",
+		Options: []*discordgo.ApplicationCommandOption{
+			{
+				Name:         SessionOption,
+				Description:  "Set the ATERNOS_SESSION cookie value",
+				Type:         discordgo.ApplicationCommandOptionString,
+				Required:     true,
+				ChannelTypes: []discordgo.ChannelType{discordgo.ChannelTypeGuildText},
+			},
+			{
+				Name:         ServerOption,
+				Description:  "Set the ATERNOS_SERVER cookie value",
+				Type:         discordgo.ApplicationCommandOptionString,
+				Required:     true,
+				ChannelTypes: []discordgo.ChannelType{discordgo.ChannelTypeGuildText},
+			},
+		},
+		DefaultMemberPermissions: &adminPermissions,
+		DefaultMemberPermissions: &userPermissions,
+		DMPermission:             &dmPermission,
+	},
+	{
+		Name:                     StartCommand,
+		Description:              "Start the minecraft server",
+		DefaultMemberPermissions: &adminPermissions,
+		DefaultMemberPermissions: &userPermissions,
+		DMPermission:             &dmPermission,
+	},
+	{
+		Name:                     StopCommand,
+		Description:              "Stop the minecraft server",
+		DefaultMemberPermissions: &adminPermissions,
+		DefaultMemberPermissions: &userPermissions,
+		DMPermission:             &dmPermission,
+	},
+	{
+		Name:                     PingCommand,
+		Description:              "Check if the discord bot is still alive",
+		DefaultMemberPermissions: &userPermissions,
+		DMPermission:             &dmPermission,
+	},
+	{
+		Name:                     StatusCommand,
+		Description:              "Get the minecraft server status",
+		DefaultMemberPermissions: &userPermissions,
+		DMPermission:             &dmPermission,
+	},
+	{
+		Name:                     InfoCommand,
+		Description:              "Get detailed information about the minecraft server status",
+		DefaultMemberPermissions: &userPermissions,
+		DMPermission:             &dmPermission,
+	},
+	{
+		Name:                     PlayersCommand,
+		Description:              "List active players",
+		DefaultMemberPermissions: &userPermissions,
+		DMPermission:             &dmPermission,
+	},
+	{
+		Name:                     HelpCommand,
+		Description:              "Get help",
+		DefaultMemberPermissions: &adminPermissions,
+		DefaultMemberPermissions: &userPermissions,
+		DMPermission:             &dmPermission,
+	},
 }
